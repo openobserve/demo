@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!--
+      Genuine legacy .NET Framework 4.7.2, multi-targeted with net6.0.
+
+      net472 is the real deliverable: it proves the instrumentation compiles and links
+      against .NET Framework, using only APIs available there (HttpListener, no ASP.NET
+      Core, no minimal hosting, manual W3C context propagation).
+
+      net6.0 exists so the service can actually run on machines without .NET Framework or
+      Mono (e.g. macOS). Same source, same telemetry, no #if branching for the OTel wiring.
+    -->
+    <TargetFrameworks>net472;net6.0</TargetFrameworks>
+    <LangVersion>10.0</LangVersion>
+    <RootNamespace>dotnet_demo.Legacy.MainframeAdapter</RootNamespace>
+    <AssemblyName>dotnet_demo.Legacy.MainframeAdapter</AssemblyName>
+    <CheckEolTargetFramework>false</CheckEolTargetFramework>
+    <!-- Stays inside the targeted major version: picks the newest 6.0.x patch and
+         refuses to roll forward to 7/8/9. "Disable" would demand exactly 6.0.0. -->
+    <RollForward>LatestPatch</RollForward>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTelemetry" Version="1.12.0" />
+    <PackageReference Include="OpenTelemetry.Api" Version="1.12.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.12.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.0" />
+  </ItemGroup>
+
+  <!-- Lets net472 build on macOS/Linux, where no .NET Framework targeting pack exists. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net472'">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <!-- Activity/Meter are in-box on modern .NET but a package on .NET Framework. -->
+    <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="9.0.0" />
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+</Project>

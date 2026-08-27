@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dotnet_demo Claims Console</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>dotnet_demo Claims Console</h1>
+      <p class="sub">Browser RUM and logs, correlated with the .NET backend trace</p>
+      <dl class="identity" id="identity"></dl>
+    </header>
+
+    <main>
+      <section>
+        <h2>Flows</h2>
+        <p class="hint">
+          Each button calls the API gateway. The RUM SDK injects the traceparent header, so
+          the resulting backend trace is the same trace as the browser action.
+        </p>
+        <div class="actions" id="actions"></div>
+      </section>
+
+      <section>
+        <h2>Results</h2>
+        <p class="hint">Trace ids returned by the gateway. Paste one into OpenObserve to see the backend trace.</p>
+        <table id="results">
+          <thead>
+            <tr><th>Time</th><th>Flow</th><th>Status</th><th>Duration</th><th>Trace id</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Signals</h2>
+        <div class="actions">
+          <button data-signal="error">Throw a JS error</button>
+          <button data-signal="log">Emit logs at every level</button>
+          <button data-signal="storm">Run 5 flows back to back</button>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+86784 dotnet_demo-legacy-mainframe-adapter
+86785 dotnet_demo-reporting-service
+86786 dotnet_demo-document-service
+86787 dotnet_demo-audit-service
+86788 dotnet_demo-notification-service
+86789 dotnet_demo-payment-service
+86790 dotnet_demo-adjudication-service
+86791 dotnet_demo-pricing-service
+86792 dotnet_demo-benefits-service
+86793 dotnet_demo-eligibility-service
+86794 dotnet_demo-claims-validation
+86795 dotnet_demo-claims-intake
+86796 dotnet_demo-provider-service
+86797 dotnet_demo-member-service
+86798 dotnet_demo-auth-service
+86799 dotnet_demo-api-gateway
