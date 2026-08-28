@@ -1,0 +1,595 @@
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Diagnostics;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web;
+
+using OpenTelemetry;
+using OpenTelemetry.Exporter;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+
+// IMPORTANTE:
+// Este namespace DEBE coincidir con el Inherits de Global.asax.
+// Para SSCNE se deja "SSCNE" como valor esperado.
+// Si Global.asax dice, por ejemplo, Inherits="OtroProyecto.Global",
+// cambie SOLO esta línea a: namespace OtroProyecto
+namespace SSCNE
+{
+    public class Global : HttpApplication
+    {
+        private const string ManualActivitySourceName = "SSCNE-WEB.Manual";
+        private const string StopwatchItemKey = "OTEL_REQUEST_STOPWATCH";
+        private const string TraceIdItemKey = "OTEL_TRACE_ID";
+        private const string SpanIdItemKey = "OTEL_SPAN_ID";
+        private const string CorrelationIdItemKey = "OTEL_CORRELATION_ID";
+
+        // Debe ser estático: ASP.NET/IIS puede crear varias instancias de HttpApplication.
+        private static TracerProvider _tracerProvider;
+        private static readonly ActivitySource ManualActivitySource =
+            new ActivitySource(ManualActivitySourceName, "1.0.0");
+
+        private static bool _diagnosticMode;
+        private static string _serviceName = "SSCNE-WEB";
+        private static string _deploymentEnvironment = "test";
+
+        protected void Application_Start(object sender, EventArgs e)
+        {
+            // CONFIGURACIÓN EXISTENTE DE LOG4NET - NO SE ELIMINA.
+            log4net.Config.XmlConfigurator.Configure(new FileInfo(Server.MapPath("~/Web.config")));
+
+            log4net.ILog log = log4net.LogManager.GetLogger(typeof(Global));
+
+            try
+            {
+                // .NET Framework puede negociar protocolos antiguos si no se fuerza TLS 1.2.
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+
+                // Fuerza IDs W3C para poder propagar traceparent entre sistemas.
+                Activity.DefaultIdFormat = ActivityIdFormat.W3C;
+                Activity.ForceDefaultIdFormat = true;
+
+                string serviceName = ConfigurationManager.AppSettings["OTEL_SERVICE_NAME"];
+                string resourceAttributes = ConfigurationManager.AppSettings["OTEL_RESOURCE_ATTRIBUTES"];
+                string tracesEndpoint = ConfigurationManager.AppSettings["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"];
+                string protocol = ConfigurationManager.AppSettings["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"];
+                string samplerName = ConfigurationManager.AppSettings["OTEL_TRACES_SAMPLER"];
+                string otlpHeaders = ConfigurationManager.AppSettings["OTEL_EXPORTER_OTLP_HEADERS"];
+                string streamName = ConfigurationManager.AppSettings["OTEL_STREAM_NAME"];
+                string diagnosticModeRaw = ConfigurationManager.AppSettings["OTEL_DIAGNOSTIC_MODE"];
+                string startupTestRaw = ConfigurationManager.AppSettings["OTEL_STARTUP_TEST"];
+
+                _serviceName = string.IsNullOrWhiteSpace(serviceName) ? "SSCNE-WEB" : serviceName.Trim();
+                _diagnosticMode = IsTrue(diagnosticModeRaw);
+
+                if (string.IsNullOrWhiteSpace(tracesEndpoint))
+                {
+                    throw new ConfigurationErrorsException(
+                        "Falta OTEL_EXPORTER_OTLP_TRACES_ENDPOINT en Web.config.");
+                }
+
+                Uri endpoint;
+                if (!Uri.TryCreate(tracesEndpoint, UriKind.Absolute, out endpoint))
+                {
+                    throw new ConfigurationErrorsException(
+                        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT no contiene una URL válida.");
+                }
+
+                if (!endpoint.AbsolutePath.EndsWith("/v1/traces", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new ConfigurationErrorsException(
+                        "Para OTLP/HTTP de OpenObserve el endpoint de trazas debe terminar en /v1/traces.");
+                }
+
+                if (!string.IsNullOrWhiteSpace(protocol) &&
+                    !string.Equals(protocol.Trim(), "http/protobuf", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new ConfigurationErrorsException(
+                        "Esta configuración está preparada para OTLP HTTP/Protobuf. " +
+                        "Use OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf.");
+                }
+
+                if (string.IsNullOrWhiteSpace(otlpHeaders))
+                {
+                    throw new ConfigurationErrorsException(
+                        "Falta OTEL_EXPORTER_OTLP_HEADERS en Web.config.");
+                }
+
+                Dictionary<string, string> parsedHeaders = ParseHeaders(otlpHeaders);
+                if (!parsedHeaders.ContainsKey("Authorization"))
+                {
+                    throw new ConfigurationErrorsException(
+                        "OTEL_EXPORTER_OTLP_HEADERS debe contener Authorization.");
+                }
+
+                if (string.IsNullOrWhiteSpace(streamName))
+                {
+                    streamName = "default";
+                }
+
+                // Para OpenObserve es útil fijar de forma explícita el stream.
+                if (!parsedHeaders.ContainsKey("stream-name"))
+                {
+                    parsedHeaders["stream-name"] = streamName;
+                }
+
+                List<KeyValuePair<string, object>> parsedResourceAttributes =
+                    new List<KeyValuePair<string, object>>(ParseResourceAttributes(resourceAttributes));
+
+                string serviceVersion = "1.0.0";
+                foreach (KeyValuePair<string, object> attribute in parsedResourceAttributes)
+                {
+                    if (string.Equals(attribute.Key, "deployment.environment", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(attribute.Key, "deployment.environment.name", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _deploymentEnvironment = Convert.ToString(attribute.Value);
+                    }
+                    else if (string.Equals(attribute.Key, "service.version", StringComparison.OrdinalIgnoreCase))
+                    {
+                        serviceVersion = Convert.ToString(attribute.Value);
+                    }
+                }
+
+                Sampler sampler = BuildSampler(samplerName);
+
+                ResourceBuilder resourceBuilder = ResourceBuilder.CreateDefault()
+                    .AddService(
+                        serviceName: _serviceName,
+                        serviceVersion: serviceVersion,
+                        serviceInstanceId: Environment.MachineName + "-" + Process.GetCurrentProcess().Id)
+                    .AddAttributes(parsedResourceAttributes)
+                    .AddAttributes(new[]
+                    {
+                        new KeyValuePair<string, object>("host.name", Environment.MachineName),
+                        new KeyValuePair<string, object>("process.pid", Process.GetCurrentProcess().Id),
+                        new KeyValuePair<string, object>("telemetry.exporter", "otlp-http")
+                    });
+
+                TracerProviderBuilder tracerBuilder = Sdk.CreateTracerProviderBuilder()
+                    .SetResourceBuilder(resourceBuilder)
+
+                    // Lee OTEL_TRACES_SAMPLER. Con parentbased_always_on se conserva el 100 %
+                    // de traces raíz y se respeta la decisión de muestreo del padre si existe.
+                    .SetSampler(sampler)
+
+                    // Necesario para el span manual de diagnóstico y futuros spans internos.
+                    .AddSource(ManualActivitySourceName)
+
+                    // Captura solicitudes entrantes ASP.NET clásico.
+                    .AddAspNetInstrumentation(options =>
+                    {
+                        options.RecordException = true;
+                    })
+
+                    // Captura HttpClient saliente y propaga traceparent automáticamente.
+                    .AddHttpClientInstrumentation(options =>
+                    {
+                        options.RecordException = true;
+                    })
+
+                    .AddOtlpExporter(options =>
+                    {
+                        options.Endpoint = endpoint;
+                        options.Protocol = OtlpExportProtocol.HttpProtobuf;
+                        options.TimeoutMilliseconds = 15000;
+
+                        // En diagnóstico se exporta cada span al terminar para ver el resultado enseguida.
+                        if (_diagnosticMode)
+                        {
+                            options.ExportProcessorType = ExportProcessorType.Simple;
+                        }
+
+                        // No usamos options.Headers. Colocamos los headers directamente en HttpClient
+                        // para evitar problemas con Authorization Basic y el padding '=' de Base64.
+                        options.HttpClientFactory = delegate
+                        {
+                            HttpClient client = new HttpClient(
+                                new OtlpDiagnosticsHandler(log, _diagnosticMode));
+
+                            client.Timeout = TimeSpan.FromMilliseconds(15000);
+
+                            foreach (KeyValuePair<string, string> header in parsedHeaders)
+                            {
+                                client.DefaultRequestHeaders.TryAddWithoutValidation(
+                                    header.Key, header.Value);
+                            }
+
+                            return client;
+                        };
+                    });
+
+                _tracerProvider = tracerBuilder.Build();
+
+                log.Info(
+                    "OTEL INICIO OK => Clase=" + typeof(Global).FullName +
+                    ", Servicio=" + _serviceName +
+                    ", Ambiente=" + _deploymentEnvironment +
+                    ", Endpoint=" + endpoint +
+                    ", Stream=" + streamName +
+                    ", Sampler=" + (string.IsNullOrWhiteSpace(samplerName) ? "parentbased_always_on" : samplerName) +
+                    ", DiagnosticMode=" + _diagnosticMode);
+
+                // Span controlado: permite comprobar exporter/autenticación/red sin depender de IIS.
+                if (IsTrue(startupTestRaw))
+                {
+                    using (Activity startupActivity = ManualActivitySource.StartActivity(
+                        "SSCNE.OTEL.STARTUP.TEST", ActivityKind.Internal))
+                    {
+                        if (startupActivity == null)
+                        {
+                            log.Error(
+                                "OTEL STARTUP TEST ERROR => StartActivity devolvió NULL. " +
+                                "Revise AddSource y TracerProvider.");
+                        }
+                        else
+                        {
+                            startupActivity.SetTag("otel.test", true);
+                            startupActivity.SetTag("app.name", "SSCNE");
+                            startupActivity.SetTag("deployment.environment", _deploymentEnvironment);
+                            startupActivity.SetTag("service.name", _serviceName);
+
+                            log.Info(
+                                "OTEL STARTUP TEST CREADO => TraceId=" +
+                                startupActivity.TraceId.ToHexString() +
+                                ", SpanId=" + startupActivity.SpanId.ToHexString());
+                        }
+                    }
+
+                    bool flushed = _tracerProvider.ForceFlush(10000);
+                    log.Info("OTEL STARTUP TEST FORCEFLUSH => Resultado=" + flushed);
+                }
+            }
+            catch (Exception ex)
+            {
+                // No se tumba la aplicación por una falla de observabilidad.
+                log.Error("ERROR AL INICIAR OPEN TELEMETRY / OPENOBSERVE => " + ex);
+            }
+        }
+
+        protected void Application_BeginRequest(object sender, EventArgs e)
+        {
+            log4net.ILog log = log4net.LogManager.GetLogger(typeof(Global));
+
+            try
+            {
+                Context.Items[StopwatchItemKey] = Stopwatch.StartNew();
+
+                string correlationId = Request.Headers["X-Correlation-Id"];
+                if (string.IsNullOrWhiteSpace(correlationId))
+                {
+                    correlationId = Guid.NewGuid().ToString("N");
+                }
+
+                Context.Items[CorrelationIdItemKey] = correlationId;
+
+                Activity activity = Activity.Current;
+                if (activity != null)
+                {
+                    string traceId = activity.TraceId.ToHexString();
+                    string spanId = activity.SpanId.ToHexString();
+
+                    Context.Items[TraceIdItemKey] = traceId;
+                    Context.Items[SpanIdItemKey] = spanId;
+
+                    activity.SetTag("app.correlation_id", correlationId);
+                    activity.SetTag("app.service", _serviceName);
+                    activity.SetTag("deployment.environment", _deploymentEnvironment);
+
+                    // Devuelve IDs al cliente/QA, igual que el patrón del demo de OpenObserve.
+                    Response.Headers["X-Trace-Id"] = traceId;
+                    Response.Headers["X-Span-Id"] = spanId;
+                    Response.Headers["X-Correlation-Id"] = correlationId;
+
+                    // Hace que los logs log4net producidos durante la solicitud lleven correlación.
+                    log4net.LogicalThreadContext.Properties["trace_id"] = traceId;
+                    log4net.LogicalThreadContext.Properties["span_id"] = spanId;
+                    log4net.LogicalThreadContext.Properties["correlation_id"] = correlationId;
+
+                    if (_diagnosticMode)
+                    {
+                        log.Info(
+                            "OTEL REQUEST START => " + Request.HttpMethod + " " + Request.Path +
+                            ", TraceId=" + traceId +
+                            ", SpanId=" + spanId +
+                            ", CorrelationId=" + correlationId);
+                    }
+                }
+                else
+                {
+                    // Ésta es la señal más útil para detectar que TelemetryHttpModule no creó el span.
+                    log4net.LogicalThreadContext.Properties["correlation_id"] = correlationId;
+
+                    log.Warn(
+                        "OTEL WARNING => Application_BeginRequest ejecutó pero Activity.Current es NULL. " +
+                        "Revise TelemetryHttpModule, DLL de OpenTelemetry.Instrumentation.AspNet, " +
+                        "Application Pool en modo Integrated y el Inherits de Global.asax.");
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error("OTEL BeginRequest ERROR => " + ex);
+            }
+        }
+
+        protected void Application_EndRequest(object sender, EventArgs e)
+        {
+            log4net.ILog log = log4net.LogManager.GetLogger(typeof(Global));
+
+            try
+            {
+                Stopwatch sw = Context.Items[StopwatchItemKey] as Stopwatch;
+                if (sw != null && sw.IsRunning)
+                {
+                    sw.Stop();
+                }
+
+                string traceId = Convert.ToString(Context.Items[TraceIdItemKey]);
+                string spanId = Convert.ToString(Context.Items[SpanIdItemKey]);
+                string correlationId = Convert.ToString(Context.Items[CorrelationIdItemKey]);
+
+                if (_diagnosticMode)
+                {
+                    log.Info(
+                        "OTEL REQUEST END => " + Request.HttpMethod + " " + Request.Path +
+                        ", HTTP=" + Response.StatusCode +
+                        ", DuracionMs=" + (sw == null ? -1 : sw.Elapsed.TotalMilliseconds) +
+                        ", TraceId=" + traceId +
+                        ", SpanId=" + spanId +
+                        ", CorrelationId=" + correlationId);
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error("OTEL EndRequest ERROR => " + ex);
+            }
+            finally
+            {
+                log4net.LogicalThreadContext.Properties.Remove("trace_id");
+                log4net.LogicalThreadContext.Properties.Remove("span_id");
+                log4net.LogicalThreadContext.Properties.Remove("correlation_id");
+            }
+        }
+
+        protected void Application_Error(object sender, EventArgs e)
+        {
+            log4net.ILog log = log4net.LogManager.GetLogger(typeof(Global));
+
+            try
+            {
+                Exception ex = Server.GetLastError();
+                if (ex == null)
+                {
+                    return;
+                }
+
+                Activity activity = Activity.Current;
+                if (activity != null)
+                {
+                    activity.SetStatus(ActivityStatusCode.Error, ex.Message);
+                    activity.SetTag("error", true);
+                    activity.SetTag("exception.type", ex.GetType().FullName);
+                    activity.SetTag("exception.message", ex.Message);
+                }
+
+                if (!(ex is System.Web.UI.ViewStateException))
+                {
+                    log.Error("ERROR OCURRIDO POR => " + ex);
+                }
+
+                if (ex is HttpRequestValidationException)
+                {
+                    // Se conserva el comportamiento existente de la aplicación.
+                    Response.Redirect("Error.aspx", true);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error("LOG => " + ex);
+            }
+        }
+
+        protected void Session_Start(object sender, EventArgs e)
+        {
+        }
+
+        protected void Application_AuthenticateRequest(object sender, EventArgs e)
+        {
+        }
+
+        protected void Session_End(object sender, EventArgs e)
+        {
+        }
+
+        protected void Application_End(object sender, EventArgs e)
+        {
+            log4net.ILog log = log4net.LogManager.GetLogger(typeof(Global));
+
+            try
+            {
+                if (_tracerProvider != null)
+                {
+                    bool flushed = _tracerProvider.ForceFlush(10000);
+                    log.Info("OTEL Application_End ForceFlush => Resultado=" + flushed);
+                    _tracerProvider.Dispose();
+                    _tracerProvider = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error("OTEL Application_End ERROR => " + ex);
+            }
+        }
+
+
+        private static Sampler BuildSampler(string samplerName)
+        {
+            string normalized = string.IsNullOrWhiteSpace(samplerName)
+                ? "parentbased_always_on"
+                : samplerName.Trim().ToLowerInvariant();
+
+            switch (normalized)
+            {
+                case "always_on":
+                    return new AlwaysOnSampler();
+
+                case "always_off":
+                    return new AlwaysOffSampler();
+
+                case "parentbased_always_on":
+                    return new ParentBasedSampler(new AlwaysOnSampler());
+
+                case "parentbased_always_off":
+                    return new ParentBasedSampler(new AlwaysOffSampler());
+
+                default:
+                    throw new ConfigurationErrorsException(
+                        "OTEL_TRACES_SAMPLER no soportado por esta configuración: " + samplerName +
+                        ". Use parentbased_always_on, always_on, parentbased_always_off o always_off.");
+            }
+        }
+
+        private static bool IsTrue(string value)
+        {
+            return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "si", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "sí", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static IEnumerable<KeyValuePair<string, object>> ParseResourceAttributes(string rawValue)
+        {
+            List<KeyValuePair<string, object>> attributes =
+                new List<KeyValuePair<string, object>>();
+
+            if (string.IsNullOrWhiteSpace(rawValue))
+            {
+                return attributes;
+            }
+
+            foreach (string item in rawValue.Split(
+                new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int separatorIndex = item.IndexOf('=');
+                if (separatorIndex <= 0)
+                {
+                    continue;
+                }
+
+                string key = item.Substring(0, separatorIndex).Trim();
+                string value = item.Substring(separatorIndex + 1).Trim();
+
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    attributes.Add(new KeyValuePair<string, object>(key, value));
+                }
+            }
+
+            return attributes;
+        }
+
+        private static Dictionary<string, string> ParseHeaders(string rawValue)
+        {
+            Dictionary<string, string> headers =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            if (string.IsNullOrWhiteSpace(rawValue))
+            {
+                return headers;
+            }
+
+            foreach (string item in rawValue.Split(
+                new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int separatorIndex = item.IndexOf('=');
+                if (separatorIndex <= 0)
+                {
+                    continue;
+                }
+
+                string key = item.Substring(0, separatorIndex).Trim();
+                string value = item.Substring(separatorIndex + 1).Trim();
+
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    headers[key] = Uri.UnescapeDataString(value);
+                }
+            }
+
+            return headers;
+        }
+
+        /// <summary>
+        /// Muestra en log4net si OpenObserve aceptó o rechazó cada exportación OTLP.
+        /// Los errores siempre se registran; los 2xx solo cuando OTEL_DIAGNOSTIC_MODE=true.
+        /// </summary>
+        private sealed class OtlpDiagnosticsHandler : DelegatingHandler
+        {
+            private readonly log4net.ILog _log;
+            private readonly bool _verbose;
+
+            public OtlpDiagnosticsHandler(log4net.ILog log, bool verbose)
+                : base(new HttpClientHandler())
+            {
+                _log = log;
+                _verbose = verbose;
+            }
+
+            protected override async Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request,
+                CancellationToken cancellationToken)
+            {
+                try
+                {
+                    HttpResponseMessage response =
+                        await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        string body = string.Empty;
+                        try
+                        {
+                            body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                        }
+
+                        if (body != null && body.Length > 500)
+                        {
+                            body = body.Substring(0, 500) + "...";
+                        }
+
+                        _log.Error(
+                            "OTLP EXPORT FAILED => HTTP=" + (int)response.StatusCode +
+                            " " + response.ReasonPhrase +
+                            ", Endpoint=" + request.RequestUri +
+                            ", Body=" + body);
+                    }
+                    else if (_verbose)
+                    {
+                        _log.Info(
+                            "OTLP EXPORT OK => HTTP=" + (int)response.StatusCode +
+                            ", Endpoint=" + request.RequestUri);
+                    }
+
+                    return response;
+                }
+                catch (Exception ex)
+                {
+                    _log.Error(
+                        "OTLP EXPORT EXCEPTION => " + ex.GetType().FullName +
+                        ": " + ex.Message,
+                        ex);
+                    throw;
+                }
+            }
+        }
+    }
+}
